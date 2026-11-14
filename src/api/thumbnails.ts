@@ -1,9 +1,15 @@
 import { getBearerToken, validateJWT } from "../auth";
 import { respondWithJSON } from "./json";
-import { getVideo } from "../db/videos";
+import { getVideo, updateVideo } from "../db/videos";
 import type { ApiConfig } from "../config";
 import type { BunRequest } from "bun";
-import { BadRequestError, NotFoundError } from "./errors";
+import {
+  BadRequestError,
+  NotFoundError,
+  UserForbiddenError,
+} from "./errors";
+import { Buffer } from "node:buffer";
+import path from "node:path";
 
 type Thumbnail = {
   data: ArrayBuffer;
@@ -36,8 +42,12 @@ export async function handlerGetThumbnail(cfg: ApiConfig, req: BunRequest) {
   });
 }
 
-export async function handlerUploadThumbnail(cfg: ApiConfig, req: BunRequest) {
+export async function handlerUploadThumbnail(
+  cfg: ApiConfig,
+  req: BunRequest
+) {
   const { videoId } = req.params as { videoId?: string };
+
   if (!videoId) {
     throw new BadRequestError("Invalid video ID");
   }
@@ -45,9 +55,71 @@ export async function handlerUploadThumbnail(cfg: ApiConfig, req: BunRequest) {
   const token = getBearerToken(req.headers);
   const userID = validateJWT(token, cfg.jwtSecret);
 
-  console.log("uploading thumbnail for video", videoId, "by user", userID);
+  // 1. Parse form data
+  const formData = await req.formData();
 
-  // TODO: implement the upload here
+  // 2. Retrieve the thumbnail
+  const file = formData.get("thumbnail");
 
-  return respondWithJSON(200, null);
+  if (!(file instanceof File)) {
+    throw new BadRequestError("Thumbnail file missing");
+  }
+
+  // 3. Validate file size
+  const MAX_UPLOAD_SIZE = 10 << 20;
+
+  if (file.size > MAX_UPLOAD_SIZE) {
+    throw new BadRequestError("File is too big");
+  }
+
+  // 4. Get media type
+  const mediaType = file.type;
+
+  if (mediaType !== "image/jpeg" && mediaType !== "image/png") {
+    throw new BadRequestError("Invalid media type");
+  }
+
+  // 5. Get file extension
+  const extension = mediaType.split("/")[1];
+
+  if (!extension) {
+    throw new BadRequestError("Invalid file type");
+  }
+
+  // 6. Read binary image data
+  const imageData = await file.arrayBuffer();
+
+  // 7. Retrieve video metadata
+  const video = getVideo(cfg.db, videoId);
+
+  if (!video) {
+    throw new NotFoundError("Video not found");
+  }
+
+  // 8. Check ownership
+  if (video.userID !== userID) {
+    throw new UserForbiddenError("You do not own this video");
+  }
+
+  // 9. Generate file name
+  const fileName = `${videoId}.${extension}`;
+
+  // 10. Generate file system path
+  const filePath = path.join(cfg.assetsRoot, fileName);
+
+  // 11. Write image to disk
+  await Bun.write(filePath, imageData);
+
+  // 12. Generate thumbnail URL
+  const thumbnailURL =
+    `http://localhost:${cfg.port}/assets/${fileName}`;
+
+  // 13. Update video metadata
+  video.thumbnailURL = thumbnailURL;
+
+  // 14. Update SQLite database
+  updateVideo(cfg.db, video);
+
+  // 15. Return updated video metadata
+  return respondWithJSON(200, video);
 }
